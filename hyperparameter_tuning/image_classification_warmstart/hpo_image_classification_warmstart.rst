@@ -1,0 +1,508 @@
+Automatic Model Tuning : Warm Starting Tuning Jobs
+==================================================
+
+\_*\* Using Warm Start to tune End-to-End Multiclass Image
+Classification \**\_
+
+Contents
+--------
+
+1.  `Background <#Background>`__
+2.  `Set_up <#Set-up>`__
+3.  `Data_preparation <#Data-preparation>`__
+4.  `Set_up_hyperparameter_tuning_job <#Set-up-hyperparameter-tuning-job>`__
+5.  `Launch_hyperparameter_tuning_job <#Launch-hyperparameter-tuning-job>`__
+6.  `Set_up_hyperparameter_tuning_using_warm_start_configuration <#Set-up-hyperparameter-tuning-job-using-warm-start-configuration>`__
+7.  `Launch_hyperparameter_tuning_job_using_warm_start_configuration <#Launch-hyperparameter-tuning-job-using-warm-start-configuration>`__
+8.  `Get_the_best_model <#Get-the-best-model>`__
+9.  `Launch_hyperparameter_tuning_job_using_warm_start_configuration_with_transfer_learning <#Launch-hyperparameter-tuning-job-using-warm-start-configuration-with-transfer-learning>`__
+10. `Wrap_up <#Wrap-up>`__
+
+--------------
+
+Background
+----------
+
+Selecting the right hyperparameter values for your machine learning
+model can be difficult. The right answer is dependent on your data; some
+algorithms have many different hyperparameters that can be tweaked; some
+are very sensitive to the hyperparameter values selected; and most have
+a non-linear relationship between model fit and hyperparameter values.
+
+Amazon SageMaker Automatic Model Tuning helps with automating the
+hyperparameter tuning process. In many occasions the tuning process is
+iterative and requires to run multiple tuning jobs after analyzing the
+results to get the best objective metric.
+
+This notebook will demonstrate how to iteratively tune an image
+classifer leveraging the warm start feature of Amazon SageMaker
+Automatic Model Tuning. The `caltech-256
+dataset <http://www.vision.caltech.edu/Image_Datasets/Caltech256/>`__
+will be used to train the image classifier.
+
+Warm start configuration allows you to create a new tuning job with the
+learning gathered in a parent tuning job by specifying up to 5 parent
+tuning jobs. If a warm start configuration is specified, Automatic Model
+Tuning will load the previous [hyperparameter set, objective metrics
+values] to warm start the new tuning job. This means, you can continue
+optimizing your model from the point you finished your previous tuning
+job experiment.
+
+--------------
+
+Set up
+------
+
+Let’s start by specifying:
+
+-  The S3 bucket and prefix that you want to use for your training and
+   model data. This should be within the same region as SageMaker
+   training.
+-  The IAM role used to give training access to your data.
+
+.. code:: ipython3
+
+    %%time
+    import sagemaker
+    from sagemaker import get_execution_role
+    import boto3
+    
+    role = get_execution_role()
+    print(role)
+    
+    sess = sagemaker.Session()
+    bucket=sess.default_bucket()
+    prefix = 'ic-fulltraining'
+
+.. code:: ipython3
+
+    from sagemaker.amazon.amazon_estimator import get_image_uri
+    
+    training_image = get_image_uri(sess.boto_region_name, 'image-classification', repo_version="1")
+    print (training_image)
+    
+    smclient = boto3.Session().client('sagemaker')
+
+Data preparation
+----------------
+
+Download the data and transfer to S3 for use in training. In this
+example, we are using
+`Caltech-256 <http://www.vision.caltech.edu/Image_Datasets/Caltech256/>`__
+dataset, which contains 30608 images of 256 objects. For the training
+and validation data, we follow the splitting scheme in this MXNet
+`example <https://github.com/apache/incubator-mxnet/blob/master/example/image-classification/data/caltech256.sh>`__.
+In particular, it randomly selects 60 images per class for training, and
+uses the remaining data for validation. The algorithm takes ``RecordIO``
+files as input. The user can also provide the image files as input,
+which will be converted into ``RecordIO`` format using MXNet’s
+`im2rec <https://mxnet.incubator.apache.org/how_to/recordio.html?highlight=im2rec>`__
+tool. It takes around 50 seconds to converted the entire Caltech-256
+dataset (~1.2GB) on a p2.xlarge instance. However, for this example, we
+will directly use recordio format.
+
+.. code:: ipython3
+
+    import os 
+    import urllib.request
+    
+    
+    def download(url):
+        filename = url.split("/")[-1]
+        if not os.path.exists(filename):
+            urllib.request.urlretrieve(url, filename)
+    
+    # caltech-256
+    download('http://data.mxnet.io/data/caltech-256/caltech-256-60-train.rec')
+    download('http://data.mxnet.io/data/caltech-256/caltech-256-60-val.rec')
+
+.. code:: ipython3
+
+    # Four channels: train, validation, train_lst, and validation_lst
+    s3train = 's3://{}/{}/train/'.format(bucket, prefix)
+    s3validation = 's3://{}/{}/validation/'.format(bucket, prefix)
+    
+    # upload the lst files to train and validation channels
+    !aws s3 cp caltech-256-60-train.rec $s3train --quiet
+    !aws s3 cp caltech-256-60-val.rec $s3validation --quiet
+
+.. code:: ipython3
+
+    #Set the data type and channels used for training
+    s3_output_location = 's3://{}/{}/output'.format(bucket, prefix)
+    s3_input_train = sagemaker.session.s3_input(s3train, distribution='FullyReplicated', 
+                            content_type='application/x-recordio', s3_data_type='S3Prefix')
+    s3_input_validation = sagemaker.session.s3_input(s3validation, distribution='FullyReplicated', 
+                                 content_type='application/x-recordio', s3_data_type='S3Prefix')
+
+Set up hyperparameter tuning job
+--------------------------------
+
+Now that we have prepared the dataset, we are ready to train models.
+
+For this example we will use image classification with Stochastic
+gradient descent (sgd) optimizer and we will tune learning_rate,
+weight_decay and momentum hyperparameters. Find
+`here <https://docs.aws.amazon.com/sagemaker/latest/dg/IC-tuning.html>`__
+the full list of hyperparameters that can be tuned.
+
+Before we can launch the tuning job, we need to configure the training
+jobs the hyperparameter tuning job will launch by defining an estimator
+that specifies the following information: \* The container image for the
+algorithm (image-classification) \* The type and number of instances to
+use for the training jobs \* The stopping condition for the training
+jobs \* The values of any algorithm hyperparameters that are not tuned
+in the tuning job (StaticHyperparameters) \* **num_layers**: The number
+of layers (depth) for the network. We use 18 in this samples but other
+values such as 50, 152 can be used. \* **image_shape**: The input image
+dimensions,‘num_channels, height, width’, for the network. It should be
+no larger than the actual image size. The number of channels should be
+same as in the actual image. \* **num_classes**: This is the number of
+output classes for the new dataset. For caltech, we use 257 because it
+has 256 object categories + 1 clutter class. \*
+**num_training_samples**: This is the total number of training samples.
+It is set to 15240 for caltech dataset with the current split. \*
+**mini_batch_size**: The number of training samples used for each mini
+batch. In distributed training, the number of training samples used per
+batch will be N \* mini_batch_size where N is the number of hosts on
+which training is run. \* **epochs**: Number of training epochs. In this
+example we set it to only 10 to save the cost. If you would like to get
+higher accuracy the number of epochs can be increased. \* **optimizer**:
+“sgd” Stochastic gradient descent \* **top_k**: Report the top-k
+accuracy during training. \* **precision_dtype**: Training datatype
+precision (default: float32). If set to ‘float16’, the training will be
+done in mixed_precision mode and will be faster than float32 mode \*
+**augmentation_type**: crop. Randomly crop the image and flip the image
+horizontally
+
+**Note: you should explicitly add any hyperparameter with the default
+value to the set of static hyperparameters instead of omitting it. This
+is important to be able to tune this hyperparameter using warm start in
+subsequent tuning job that uses the results of this tuning job as a
+starting point.**
+
+.. code:: ipython3
+
+    sess = sagemaker.Session()
+    
+    imageclassification = sagemaker.estimator.Estimator(training_image,
+                                        role, 
+                                        train_instance_count=1, 
+                                        train_instance_type='ml.p3.2xlarge',
+                                        output_path=s3_output_location,
+                                        sagemaker_session=sess)
+    
+    imageclassification.set_hyperparameters(num_layers=18,
+                                            image_shape='3,224,224',
+                                            num_classes=257,
+                                            num_training_samples=15420,
+                                            mini_batch_size=128,
+                                            epochs=10,
+                                            optimizer='sgd',
+                                            top_k='2',
+                                            precision_dtype='float32',
+                                            augmentation_type='crop')
+
+Next, we set up the tuning job with the following configuration: \* the
+hyperparameters that SageMaker Automatic Model Tuning will tune:
+learning_rate, momentum and weight_decay \* the maximum number of
+training jobs it will run to optimize the objective metric: 5 \* the
+number of parallel training jobs that will run in the tuning job: 2 \*
+the objective metric that Automatic Model Tuning will use:
+validation:accuracy
+
+.. code:: ipython3
+
+    from sagemaker.tuner import IntegerParameter, CategoricalParameter, ContinuousParameter, HyperparameterTuner
+    
+    hyperparameter_ranges = {'learning_rate': ContinuousParameter(0.0001, 0.05),
+                             'momentum': ContinuousParameter(0.0, 0.99),
+                             'weight_decay': ContinuousParameter(0.0, 0.99)}
+    
+    objective_metric_name = 'validation:accuracy'
+    
+    tuner = HyperparameterTuner(imageclassification,
+                                objective_metric_name,
+                                hyperparameter_ranges,
+                                objective_type='Maximize',
+                                max_jobs=5,
+                                max_parallel_jobs=2)
+
+Launch hyperparameter tuning job
+--------------------------------
+
+Now we can launch a hyperparameter tuning job by calling fit in tuner.
+After the hyperparameter tuning job is created, we can go to SageMaker
+console to track the progress of the hyperparameter tuning job until it
+is completed.
+
+.. code:: ipython3
+
+    tuner.fit({'train': s3_input_train, 'validation': s3_input_validation},include_cls_metadata=False)
+
+*You will be unable to successfully run the following cells until the
+tuning job completes.*
+
+Once the tuning job finishes, we can bring in a table of metrics.
+
+.. code:: ipython3
+
+    tuning_job_name = tuner._current_job_name
+    
+    tuner_parent_metrics = sagemaker.HyperparameterTuningJobAnalytics(tuning_job_name)
+    if not tuner_parent_metrics.dataframe().empty:
+        df_parent = tuner_parent_metrics.dataframe().sort_values(['FinalObjectiveValue'], ascending=False)
+        
+    df_parent
+
+You can analize the results deeper by using
+HPO_Analyze_TuningJob_Results.ipynb notebook. Here, we will just plot
+how the objective metric changes overtime as the tuning progresses.
+
+.. code:: ipython3
+
+    import bokeh
+    import bokeh.io
+    bokeh.io.output_notebook()
+    from bokeh.plotting import figure, show
+    from bokeh.models import HoverTool
+    
+    import pandas as pd
+    
+    df_parent_objective_value = df_parent[df_parent['FinalObjectiveValue'] > -float('inf')]
+    
+    p = figure(plot_width=900, plot_height=400, x_axis_type='datetime',x_axis_label='datetime', y_axis_label=objective_metric_name)
+    p.circle(source=df_parent_objective_value, x='TrainingStartTime', y='FinalObjectiveValue', color='black')
+    
+    show(p)
+
+Depending on how your first hyperparameter tuning job went, you may or
+may not want to try another tuning job to see whether the model quality
+can be further improved. When you decide to run another tuning job, you
+would want to leverage what has been known about the search space from
+the completed tuning job. In that case, you can create a new
+hyperparameter tuning job, while warm starting it using the completed
+tuning job, instead of starting from scratch.
+
+To show you how to use warm start, next we will run a second tuning job
+and enable warm start.
+
+Set up hyperparameter tuning using warm start configuration
+-----------------------------------------------------------
+
+To use warm start in the new tuning job, we need to specify 2
+parameters: \* the list of parent tuning jobs the new tuning job should
+use as a starting point (The maximum number of parents can be 5). \* the
+type of warm start configuration: \* ‘IDENTICAL_DATA_AND_ALGORITHM’ warm
+starts a tuning job with previous evaluations essentially with the same
+task, allowing slightly change in the search space. This option should
+be use when the data set and the algorithm container haven’t changed. In
+this scenario, the only changes to the docker image we recommend are
+those that do not affect the algorithm, for example changes that only
+improve logging, or add support of a different data format. \*
+‘TRANSFER_LEARNING’ warm starts a tuning job with the evaluations from
+similar tasks, allowing both search space, algorithm image and dataset
+change.
+
+In this example we will use ‘IDENTICAL_DATA_AND_ALGORITHM’ because we
+are not changing the data set or algorithm.
+
+.. code:: ipython3
+
+    from sagemaker.tuner import WarmStartConfig, WarmStartTypes
+    
+    parent_tuning_job_name = tuning_job_name
+    warm_start_config = WarmStartConfig(WarmStartTypes.IDENTICAL_DATA_AND_ALGORITHM, parents={parent_tuning_job_name})
+    
+    parent_tuning_job_name
+
+.. code:: ipython3
+
+    tuner_warm_start = HyperparameterTuner(imageclassification,
+                                objective_metric_name,
+                                hyperparameter_ranges,
+                                objective_type='Maximize',
+                                max_jobs=5,
+                                max_parallel_jobs=2,
+                                base_tuning_job_name='warmstart',
+                                warm_start_config=warm_start_config)
+
+Launch hyperparameter tuning job using warm start configuration
+---------------------------------------------------------------
+
+Now we can launch a hyperparameter tuning job by calling tuner.fit and
+passing warmSatartConfig. After the hyperparameter tuning job is
+created, we can go to SageMaker console to track the progress of the
+hyperparameter tuning job until it is completed.
+
+.. code:: ipython3
+
+    tuner_warm_start.fit({'train': s3_input_train, 'validation': s3_input_validation},include_cls_metadata=False)
+
+*You will be unable to successfully run the following cells until the
+tuning job completes.*
+
+Once the tuning job finishes, we can bring in a table of metrics.
+
+.. code:: ipython3
+
+    warmstart_tuning_job_name = tuner_warm_start._current_job_name
+    
+    tuner_warm_start_metrics = sagemaker.HyperparameterTuningJobAnalytics(warmstart_tuning_job_name)
+    if not tuner_warm_start_metrics.dataframe().empty:
+        df_warm_start = tuner_warm_start_metrics.dataframe().sort_values(['FinalObjectiveValue'], ascending=False)
+    
+    df_warm_start
+
+We then plot the objective metrics for the parent job and the current
+job.
+
+.. code:: ipython3
+
+    import bokeh
+    import bokeh.io
+    bokeh.io.output_notebook()
+    from bokeh.plotting import figure, show
+    from bokeh.models import HoverTool
+    
+    import pandas as pd
+    
+    df_parent_objective_value = df_parent[df_parent['FinalObjectiveValue'] > -float('inf')]
+    df_warm_start_objective_value = df_warm_start[df_warm_start['FinalObjectiveValue'] > -float('inf')]
+    
+    p = figure(plot_width=900, plot_height=400, x_axis_type='datetime',x_axis_label='datetime', y_axis_label=objective_metric_name)
+    p.circle(source=df_parent_objective_value, x='TrainingStartTime', y='FinalObjectiveValue', color='black')
+    p.circle(source=df_warm_start_objective_value, x='TrainingStartTime', y='FinalObjectiveValue',color='red')
+    show(p)
+
+Get the best model
+------------------
+
+When the job completes, if you are satisfy with the results, you can
+find the training job that generated the best model by using
+OverallBestTrainingJob in Automatic Model Tuning describe API. Please
+note OverallBestTrainingJob may be from the latest hyperparameter tuning
+job or one of its parent jobs, when ‘IdenticalDataAndAlgorithm’ warm
+start type is used.
+
+.. code:: ipython3
+
+    best_overall_training_job = smclient.describe_hyper_parameter_tuning_job(
+        HyperParameterTuningJobName=warmstart_tuning_job_name)['OverallBestTrainingJob']
+    
+    best_overall_training_job
+
+Launch hyperparameter tuning job using warm start configuration with transfer learning
+--------------------------------------------------------------------------------------
+
+Finally, we are going to apply some more data augmentation to the data
+set to teach the invariance of the same image to our model training and
+tuning. It is base on the assumption that, for the same object, photos
+under different composition, lighting condition, or color should all
+yield the same prediction.
+
+To create our last hyperparameter tuning job, we will use ‘Transfer
+learning’ warm start type since our data set is going to change due to
+new data augmentations. We will use both of the 2 previous tuning jobs
+we ran as parent tuning jobs.
+
+.. code:: ipython3
+
+    from sagemaker.tuner import WarmStartConfig, WarmStartTypes
+    
+    parent_tuning_job_name_2 = warmstart_tuning_job_name
+    transfer_learning_config = WarmStartConfig(WarmStartTypes.TRANSFER_LEARNING, 
+                                        parents={parent_tuning_job_name,parent_tuning_job_name_2})
+
+To apply more data augmentations we can use ‘augmentation_type’
+hyperparameter exposed by the algorithm. We will apply
+‘crop_color_transform’ transformation to the data set during training.
+With this transformation, in addition to crop and color transformations,
+random transformations (including rotation, shear, and aspect ratio
+variations) are applied to the image.
+
+.. code:: ipython3
+
+    imageclassification.set_hyperparameters(num_layers=18,
+                                            image_shape='3,224,224',
+                                            num_classes=257,
+                                            num_training_samples=15420,
+                                            mini_batch_size=128,
+                                            epochs=10,
+                                            optimizer='sgd',
+                                            top_k='2',
+                                            precision_dtype='float32',
+                                            augmentation_type='crop_color_transform')
+
+.. code:: ipython3
+
+    tuner_transfer_learning = HyperparameterTuner(imageclassification,
+                                objective_metric_name,
+                                hyperparameter_ranges,
+                                objective_type='Maximize',
+                                max_jobs=5,
+                                max_parallel_jobs=2,
+                                base_tuning_job_name='transferlearning',
+                                warm_start_config=transfer_learning_config)
+
+.. code:: ipython3
+
+    tuner_transfer_learning.fit({'train': s3_input_train, 'validation': s3_input_validation},include_cls_metadata=False)
+
+You will be unable to successfully run the following cells until the
+tuning job completes.
+
+Once the tuning job finishes, we can bring in a table of metrics.
+
+.. code:: ipython3
+
+    transferlearning_tuning_job_name = tuner_transfer_learning._current_job_name
+    
+    tuner_transferlearning_metrics = sagemaker.HyperparameterTuningJobAnalytics(transferlearning_tuning_job_name)
+    if not tuner_transferlearning_metrics.dataframe().empty:
+        df_transfer_learning = tuner_transferlearning_metrics.dataframe().sort_values(['FinalObjectiveValue'], ascending=False)
+    
+    df_transfer_learning
+
+We then plot the objective metrics for the two parent jobs and the
+current job.
+
+.. code:: ipython3
+
+    import bokeh
+    import bokeh.io
+    bokeh.io.output_notebook()
+    from bokeh.plotting import figure, show
+    from bokeh.models import HoverTool
+    
+    import pandas as pd
+    
+    df_parent_objective_value = df_parent[df_parent['FinalObjectiveValue'] > -float('inf')]
+    df_warm_start_objective_value = df_warm_start[df_warm_start['FinalObjectiveValue'] > -float('inf')]
+    df_transfer_learning_objective_value = df_transfer_learning[df_transfer_learning['FinalObjectiveValue'] > -float('inf')]
+    
+    p = figure(plot_width=900, plot_height=400, x_axis_type='datetime', x_axis_label='datetime', y_axis_label=objective_metric_name)
+    p.circle(source=df_parent_objective_value, x='TrainingStartTime', y='FinalObjectiveValue', color='black')
+    p.circle(source=df_warm_start_objective_value, x='TrainingStartTime', y='FinalObjectiveValue',color='red')
+    p.circle(source=df_transfer_learning_objective_value, x='TrainingStartTime', y='FinalObjectiveValue',color='blue')
+    show(p)
+
+After we have got the best model, we can deploy it to an endpoint.
+Please refer to other SageMaker sample notebooks or SageMaker
+documentation to see how to deploy a model.
+
+Wrap up
+-------
+
+In this notebook, we demonstrated how to use warm start to iteratively
+tune your models. Warm Start could also be used for other scenarios
+like: tuning additional hyperparameters, running smaller training jobs
+(e.g., smaller dataset or fewer epochs) in first tuning job to quickly
+explore search space then running second tuning job with full size
+training, or re-tuning a model as you’ve collected new data over time.
+
+For more information on using SageMaker’s Automatic Model Tuning, see
+our other `example
+notebooks <https://github.com/awslabs/amazon-sagemaker-examples/tree/master/hyperparameter_tuning>`__
+and
+`documentation <https://docs.aws.amazon.com/sagemaker/latest/dg/automatic-model-tuning.html>`__.

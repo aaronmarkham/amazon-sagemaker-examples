@@ -1,0 +1,271 @@
+MNIST Training using MXNet
+==========================
+
+Contents
+--------
+
+1. `Background <#Background>`__
+2. `Setup <#Setup>`__
+3. `Data <#Data>`__
+4. `Train <#Train>`__
+5. `Host <#Host>`__
+
+--------------
+
+Background
+----------
+
+Horovod is a distributed deep learning training framework for
+TensorFlow, Keras, PyTorch, and MXNet. This notebook example shows how
+to use Horovod with MXNet in SageMaker using MNIST dataset.
+
+For more information about the MXNet in SageMaker, please visit
+following github repositories: 1.
+`sagemaker-mxnet-training-toolkit <https://github.com/aws/sagemaker-mxnet-training-toolkit/>`__
+2.
+`sagemaker-python-sdk <https://github.com/aws/sagemaker-python-sdk>`__
+3.
+`sagemaker-training-toolkit <https://github.com/aws/sagemaker-training-toolkit>`__
+4.
+`deep-learning-containers <https://github.com/aws/deep-learning-containers>`__
+
+--------------
+
+Setup
+-----
+
+*This notebook was created and tested on an ml.p2.xlarge notebook
+instance.*
+
+Let’s start by creating a SageMaker session and specifying:
+
+-  The S3 bucket and prefix that you want to use for training and model
+   data. This should be within the same region as the Notebook Instance,
+   training, and hosting.
+-  The IAM role arn used to give training and hosting access to your
+   data. See the `Amazon SageMaker
+   Roles <https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-roles.html>`__
+   for how to create these. Note, if more than one role is required for
+   notebook instances, training, and/or hosting, please replace the
+   ``sagemaker.get_execution_role()`` with the appropriate full IAM role
+   arn string(s).
+
+.. code:: ipython3
+
+    import sagemaker
+    
+    sagemaker_session = sagemaker.Session()
+    
+    bucket = sagemaker_session.default_bucket()
+    prefix = 'sagemaker/DEMO-mxnet-mnist-horovod'
+    
+    role = sagemaker.get_execution_role()
+
+Data
+----
+
+Getting the data
+~~~~~~~~~~~~~~~~
+
+In this example, we will ues MNIST dataset. MNIST is a widely used
+dataset for handwritten digit classification. It consists of 70,000
+labeled 28x28 pixel grayscale images of hand-written digits. The dataset
+is split into 60,000 training images and 10,000 test images. There are
+10 classes (one for each of the 10 digits).
+
+.. code:: ipython3
+
+    from mxnet.gluon.data.vision import datasets, transforms
+    
+    datasets.MNIST('data', download=True, transform=transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ]))
+
+Uploading the data to S3
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+We are going to use the sagemaker.Session.upload_data function to upload
+our datasets to an S3 location. The return value inputs identifies the
+location – we will use later when we start the training job.
+
+.. code:: ipython3
+
+    inputs = sagemaker_session.upload_data(path='data', bucket=bucket, key_prefix=prefix)
+    print('input spec (in this case, just an S3 path): {}'.format(inputs))
+
+Train
+-----
+
+Define hyperparameters of training job. Note, that ``entry_point`` param
+defines training script which will be executed on Horovod distributed
+cluster. Additionally, you can also define any parameters of your
+training script.
+
+Training Scipt
+~~~~~~~~~~~~~~
+
+The mnist.py script provides the code we need for training a SageMaker
+model. The training script is very similar to a training script you
+might run outside of SageMaker, but you can access useful properties
+about the training environment through various environment variables,
+such as:
+
+-  ``SM_MODEL_DIR``: A string representing the path to the directory to
+   write model artifacts to. These artifacts are uploaded to S3 for
+   model hosting.
+-  ``SM_NUM_GPUS``: The number of gpus available in the current
+   container.
+-  ``SM_CURRENT_HOST``: The name of the current container on the
+   container network.
+-  ``SM_HOSTS``: JSON encoded list containing all the hosts .
+
+Supposing one input channel, ‘training’, was used in the call to the
+PyTorch estimator’s fit() method, the following will be set, following
+the format SM_CHANNEL_[channel_name]:
+
+-  ``SM_CHANNEL_TRAINING``: A string representing the path to the
+   directory containing data in the ‘training’ channel.
+
+For more information about training environment variables, please visit
+SageMaker Containers.
+
+A typical training script loads data from the input channels, configures
+training with hyperparameters, trains a model, and saves a model to
+model_dir so that it can be hosted later. Hyperparameters are passed to
+your script as arguments and can be retrieved with an
+``argparse.ArgumentParser`` instance.
+
+This script uses Horovod framework for distributed training.
+
+You can run the following command to view the script run by this
+notebook:
+
+.. code:: ipython3
+
+    !pygmentize horovod_mnist.py
+
+Run training in SageMaker
+-------------------------
+
+The ``MXNet`` class allows us to run our training function as a training
+job on SageMaker infrastructure. We need to configure it with our
+training script, an IAM role, the number of training instances, the
+training instance type, and hyperparameters. In this case we are going
+to run our training job on 2 ``ml.p2.8xlarge`` instances. But this
+example can be ran on one or multiple, cpu or gpu instances (`full list
+of available
+instances <https://aws.amazon.com/sagemaker/pricing/instance-types/>`__).
+
+SageMaker MXNet Estimator
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Estimator API in Sagemaker Python SDK supports distributed training
+functionality via the distributions parameter. To leverage Horovod, we
+specify ``mpi`` dictionary in the distributions parameter. The
+dictionary can contain following keys - ``enabled``: True/False -
+``custom_mpi_options``: string - ``processes_per_host``: integer
+
+Note: ``train_instance_type`` and ``processes_per_host`` are
+interlinked. Make sure that ``processes_per_host`` doesn’t exceed the
+number of available GPUs in the instance.
+
+For further details on various AWS EC2 instances & available GPUs refer:
+- P3 (https://aws.amazon.com/ec2/instance-types/p3/) - G4
+(https://aws.amazon.com/ec2/instance-types/g4/)
+
+.. code:: ipython3
+
+    mpi_options = '-verbose -x orte_base_help_aggregate=0'
+    distributions = {
+        'mpi':{
+            'enabled': True,
+            'custom_mpi_options': mpi_options,
+            'processes_per_host': 4
+        }
+    }
+    hyperparameters = {
+        'batch_size': 64,
+        'dtype': 16,
+        'epochs': 5,
+        'lr': 0.02,
+    }
+
+.. code:: ipython3
+
+    estimator = MXNet(
+        entry_point='horovod_mnist.py',
+        source_dir='.'
+        role=role,
+        train_instance_type='ml.p3.8xlarge',
+        train_instance_count=2,
+        image_name=image,
+        framework_version='1.6.0',
+        py_version='py3',
+        distributions=distributions,
+        hyperparameters=hyperparameters,
+        sagemaker_session=sagemaker_session)
+
+After we’ve constructed our ``MXNet`` object, we can fit it using the
+data we uploaded to S3. SageMaker makes sure our data is available in
+the local filesystem, so our training script can simply read the data
+from disk.
+
+.. code:: ipython3
+
+    estimator.fit(job_name='test-mx-horovod', inputs={'training': inputs})
+
+Host
+----
+
+Create an inference endpoint
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+After training, we use the MXNet estimator object to build and deploy an
+MXNetPredictor. This creates a Sagemaker Endpoint – a hosted prediction
+service that we can use to perform inference.
+
+This allows us to perform inference on json encoded multi-dimensional
+arrays.
+
+The arguments to the deploy function allow us to set the number and type
+of instances that will be used for the Endpoint. These do not need to be
+the same as the values we used for the training job. For example, you
+can train a model on a set of GPU-based instances, and then deploy the
+Endpoint to a fleet of CPU-based instances. Here we will deploy the
+model to a single ``ml.m4.xlarge`` instance.
+
+.. code:: ipython3
+
+    predictor = estimator.deploy(initial_instance_count=1, instance_type='ml.m4.xlarge')
+
+Evaluate
+--------
+
+We can now use this predictor to classify hand-written digits. Drawing
+into the image box loads the pixel data into a ‘data’ variable in this
+notebook, which we can then pass to the mxnet predictor.
+
+.. code:: ipython3
+
+    from IPython.display import HTML
+    HTML(open("input.html").read())
+
+.. code:: ipython3
+
+    import numpy as np
+    
+    image = np.array([data], dtype=np.float32)
+    response = predictor.predict(image)
+    prediction = response.argmax(axis=1)[0]
+    print(prediction)
+
+Cleanup
+~~~~~~~
+
+After you have finished with this example, remember to delete the
+prediction endpoint to release the instance(s) associated with it
+
+.. code:: ipython3
+
+    estimator.delete_endpoint()
